@@ -27,7 +27,6 @@ from recognizer import Recognizer
 from operators import nms
 
 def get_project_base_directory():
-    print(f'layout_recognizer: [get_project_base_directory]')
     return os.path.abspath(
         os.path.join(
             os.path.dirname(os.path.realpath(__file__)),
@@ -39,37 +38,28 @@ def get_project_base_directory():
 
 class LayoutRecognizer(Recognizer):
     labels = [
-        "_background_",
-        "Text",
-        "Title",
-        "Figure",
-        "Figure caption",
-        "Table",
-        "Table caption",
-        "Header",
-        "Footer",
-        "Reference",
-        "Equation",
+        "_background_", # 0
+        "Text",         # 1
+        "Title",        # 2
+        "Figure",       # 3
+        "Figure caption",#4
+        "Table",        # 5
+        "Table caption",# 6
+        "Header",       # 7
+        "Footer",       # 8
+        "Reference",    # 9
+        "Equation",     # 10
     ]
 
     def __init__(self, domain):
-        try:
-            model_dir = os.path.join(
-                get_project_base_directory(),
-                "rag/res/deepdoc")
-            super().__init__(self.labels, domain, model_dir)
-        except Exception:
-            model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
-                                          local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
-                                          local_dir_use_symlinks=False)
-            super().__init__(self.labels, domain, model_dir)
-
+        model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
+                                      local_dir=os.path.join(get_project_base_directory(), "res/deepdoc"),
+                                      local_dir_use_symlinks=False)
+        print(f'layout recongizer __init__ model_dir is {model_dir}')
+        super().__init__(self.labels, domain, model_dir)
+        
         self.garbage_layouts = ["footer", "header", "reference"]
         self.client = None
-        if os.environ.get("TENSORRT_DLA_SVR"):
-            # DLAClient是个啥。
-            from deepdoc.vision.dla_cli import DLAClient
-            self.client = DLAClient(os.environ["TENSORRT_DLA_SVR"])
 
     def __call__(self, image_list, ocr_res, scale_factor=3, thr=0.2, batch_size=16, drop=True):
         """
@@ -82,7 +72,7 @@ class LayoutRecognizer(Recognizer):
         没有文本框被指定为figure,更新ocr_res
         最后返回更新后的ocr_res, 以及page_layout信息。
         """
-        logging.info(f'[LayoutRecognizer] 的调用。')
+        
         # 过滤垃圾数据的步骤
         def __is_garbage(b):
             patt = [r"^•+$", "^[0-9]{1,2} / ?[0-9]{1,2}$",
@@ -91,12 +81,9 @@ class LayoutRecognizer(Recognizer):
                     ]
             return any([re.search(p, b["text"]) for p in patt])
         
-        # 如果存在了DLACLient，那么直接利用这个Client的预测就好了
-        if self.client:
-            layouts = self.client.predict(image_list)
-        else:
-            # 调用父类，即Recognizer的模型识别。
-            layouts = super().__call__(image_list, thr, batch_size)
+        # 调用父类，即Recognizer的模型识别。
+        print(f'[LayoutRecoginzer] 开始调用')
+        layouts = super().__call__(image_list, thr, batch_size)
         # save_results(image_list, layouts, self.labels, output_dir='output/', threshold=0.7)
         # 小小的断言一下子。
         assert len(image_list) == len(ocr_res)
@@ -104,7 +91,9 @@ class LayoutRecognizer(Recognizer):
         boxes = []
         assert len(image_list) == len(layouts)
         garbages = {}
+        # 存储处理后的每页布局数据
         page_layout = []
+        # 遍历每一页的布局数据，同时获取对应的OCR结果
         for pn, lts in enumerate(layouts):
             # OCR识别的box文本框。
             bxs = ocr_res[pn]

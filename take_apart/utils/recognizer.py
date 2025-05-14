@@ -53,7 +53,7 @@ class Recognizer:
         if not model_dir:
             model_dir = os.path.join(
                         get_project_base_directory(),
-                        "rag/res/deepdoc")
+                        "res/deepdoc")
         self.ort_sess, self.run_options = load_model(model_dir, task_name)
         self.input_names = [node.name for node in self.ort_sess.get_inputs()]
         self.output_names = [node.name for node in self.ort_sess.get_outputs()]
@@ -321,6 +321,7 @@ class Recognizer:
         return inputs
 
     def postprocess(self, boxes, inputs, thr):
+        print(f'[Recoginzer.postprocess] 开始调用， boxes[0] 去分析，boxes[0][0]应该是类别id，测试：{boxes[0][0][5]}')
         if "scale_factor" in self.input_names:
             bb = []
             for b in boxes:
@@ -346,6 +347,7 @@ class Recognizer:
             return y
 
         def compute_iou(box, boxes):
+            # 计算box与boxes之间的交并比（重叠程度）
             # Compute xmin, ymin, xmax, ymax for both boxes
             xmin = np.maximum(box[0], boxes[:, 0])
             ymin = np.maximum(box[1], boxes[:, 1])
@@ -366,6 +368,8 @@ class Recognizer:
             return iou
 
         def iou_filter(boxes, scores, iou_threshold):
+            # 目标检测任务中过滤掉与高置信度边界框高度重叠的冗余检测框。
+            # 保证检测精度的前提下，减少重复检测的冗余框。
             sorted_indices = np.argsort(scores)[::-1]
 
             keep_boxes = []
@@ -385,9 +389,11 @@ class Recognizer:
 
             return keep_boxes
 
-        boxes = np.squeeze(boxes).T
+        # boxes = np.squeeze(boxes).T
+        boxes = np.squeeze(boxes)
         # Filter out object confidence scores below threshold
         scores = np.max(boxes[:, 4:], axis=1)
+        print(f'test: scores is {scores}')
         boxes = boxes[scores > thr, :]
         scores = scores[scores > thr]
         if len(boxes) == 0:
@@ -399,7 +405,6 @@ class Recognizer:
         input_shape = np.array([inputs["scale_factor"][0], inputs["scale_factor"][1], inputs["scale_factor"][0], inputs["scale_factor"][1]])
         boxes = np.multiply(boxes, input_shape, dtype=np.float32)
         boxes = xywh2xyxy(boxes)
-
         unique_class_ids = np.unique(class_ids)
         indices = []
         for class_id in unique_class_ids:
@@ -408,6 +413,7 @@ class Recognizer:
             class_scores = scores[class_indices]
             class_keep_boxes = iou_filter(class_boxes, class_scores, 0.2)
             indices.extend(class_indices[class_keep_boxes])
+        # valid_indices = [i for i in indices if class_ids[i] < len(self.label_list)]
 
         return [{
             "type": self.label_list[class_ids[i]].lower(),
@@ -417,6 +423,7 @@ class Recognizer:
 
     def __call__(self, image_list, thr=0.7, batch_size=16):
         # 传入图像列表和置信度阈值
+        print(f'[Recoginzer] 开始调用')
         res = []
         imgs = []
         # 预处理，将图像列表转换为模型输入格式
