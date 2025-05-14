@@ -22,14 +22,20 @@ from pypdf import PdfReader as pdf2_read
 print(f'Recognizer 待加载')
 from recognizer import Recognizer
 from ocr import OCR
+from layout_recognizer import LayoutRecognizer
+
+# 自定义方便测试
+from save_temp import save_json
 print(f'模块加载完成')
 
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+
 class PdfParser:
     def __init__(self):
         self.ocr = OCR()
+        self.layouter = LayoutRecognizer("layout")
     
     def _has_color(self, o):
         #print(f'[_has_color] 调用')
@@ -194,11 +200,30 @@ class PdfParser:
         if len(self.boxes) == 0 and zoomin < 9:
             self.__images__(fnm, zoomin * 3, page_from, page_to, callback)
                     
-        print(f'[__images__] 调用结束，total page is {self.total_page}')
-        
+        print(f'[__images__] 调用结束，total page is {self.total_page}，self.boxes len is {len(self.boxes)}, and {self.boxes[0][0]}')
+        for idx, box in enumerate(self.boxes):
+            for idy, b in enumerate(box):
+                save_json(b, f"boex_{idx}_{idy}")
+                
+    def _layouts_rec(self, ZM, drop= True):
+        assert len(self.page_images) == len(self.boxes)
+        print(f'[_layouts_rec] 开始调用')
+        self.boxes, self.page_layout = self.layouter(
+            self.page_images, self.boxes, ZM, drop=drop
+        )
+        print(f'layout 解析完成，接下来是合并操作')
+        # 所有页面视作一个合并处理（处理跨页）        
+        for i in range(len(self.boxes)):
+            self.boxes[i]["top"] += \
+                self.page_cum_height[self.boxes[i]["page_number"] - 1]
+            self.boxes[i]["bottom"] += \
+                self.page_cum_height[self.boxes[i]["page_number"] - 1]
+   
+            
     def __call__(self, fnm, need_image = True, zoomin=3, return_html=False):
         print(f'[__call__] 调用')
         self.__images__(fnm)
+        self._layouts_rec(zoomin)
 
 if __name__ == "__main__":
     print(f'开始执行')
