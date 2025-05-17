@@ -22,7 +22,11 @@ from pypdf import PdfReader as pdf2_read
 print(f'Recognizer 待加载')
 from recognizer import Recognizer
 from ocr import OCR
-from layout_recognizer import LayoutRecognizer
+from layout_recognizer import LayoutRecognizer4YOLOv10 as LayoutRecognizer
+
+#from layout_recognizer import LayoutRecognizer
+
+from table_structure_recognizer import TableStructureRecognizer
 
 # 自定义方便测试
 from save_temp import save_json
@@ -36,6 +40,24 @@ class PdfParser:
     def __init__(self):
         self.ocr = OCR()
         self.layouter = LayoutRecognizer("layout")
+        
+        self.tbl_det = TableStructureRecognizer()
+    
+    def __char_width(self, c):
+        return (c["x1"] - c["x0"]) // max(len(c["text"]), 1)
+
+    def __height(self, c):
+        return c["bottom"] - c["top"]
+
+    def _x_dis(self, a, b):
+        return min(abs(a["x1"] - b["x0"]), abs(a["x0"] - b["x1"]),
+                   abs(a["x0"] + a["x1"] - b["x0"] - b["x1"]) / 2)
+
+    def _y_dis(
+            self, a, b):
+        return (
+            b["top"] + b["bottom"] - a["top"] - a["bottom"]) / 2
+   
     
     def _has_color(self, o):
         #print(f'[_has_color] 调用')
@@ -218,12 +240,146 @@ class PdfParser:
                 self.page_cum_height[self.boxes[i]["page_number"] - 1]
             self.boxes[i]["bottom"] += \
                 self.page_cum_height[self.boxes[i]["page_number"] - 1]
-   
-            
+                
+    def _table_transformer_job(self, ZM):
+        print(f'[_table_transformer_job] 开始调用')
+        imgs, pos = [], []
+        tbcnt = [0]
+        MARGIN = 10
+        self.tb_cpns = []
+        assert len(self.page_layout) == len(self.page_images)
+        print(f'test: self.page_images {self.page_layout}')
+        for p, tbls in enumerate(self.page_layout):  # for page
+            tbls = [f for f in tbls if f["type"] == "table"]
+            tbcnt.append(len(tbls))
+            if not tbls:
+                print(f'没有tbls')
+                continue
+            print(f'有tbls')
+            for tb in tbls:  # for table
+                left, top, right, bott = tb["x0"] - MARGIN, tb["top"] - MARGIN, \
+                    tb["x1"] + MARGIN, tb["bottom"] + MARGIN
+                left *= ZM
+                top *= ZM
+                right *= ZM
+                bott *= ZM
+                pos.append((left, top))
+                imgs.append(self.page_images[p].crop((left, top, right, bott)))
+
+        assert len(self.page_images) == len(tbcnt) - 1
+        print(f'pos test is {pos}')
+        if not imgs:
+            print(f'[_table_transformer_job] no imgs')
+            return
+        recos = self.tbl_det(imgs)
+        tbcnt = np.cumsum(tbcnt)
+        for i in range(len(tbcnt) - 1):  # for page
+            pg = []
+            for j, tb_items in enumerate(
+                    recos[tbcnt[i]: tbcnt[i + 1]]):  # for table
+                poss = pos[tbcnt[i]: tbcnt[i + 1]]
+                for it in tb_items:  # for table components
+                    it["x0"] = (it["x0"] + poss[j][0])
+                    it["x1"] = (it["x1"] + poss[j][0])
+                    it["top"] = (it["top"] + poss[j][1])
+                    it["bottom"] = (it["bottom"] + poss[j][1])
+                    for n in ["x0", "x1", "top", "bottom"]:
+                        it[n] /= ZM
+                    it["top"] += self.page_cum_height[i]
+                    it["bottom"] += self.page_cum_height[i]
+                    it["pn"] = i
+                    it["layoutno"] = j
+                    pg.append(it)
+            self.tb_cpns.extend(pg)
+
+        def gather(kwd, fzy=10, ption=0.6):
+            eles = Recognizer.sort_Y_firstly(
+                [r for r in self.tb_cpns if re.match(kwd, r["label"])], fzy)
+            eles = Recognizer.layouts_cleanup(self.boxes, eles, 5, ption)
+            return Recognizer.sort_Y_firstly(eles, 0)
+
+        # add R,H,C,SP tag to boxes within table layout
+        headers = gather(r".*header$")
+        rows = gather(r".* (row|header)")
+        spans = gather(r".*spanning")
+        clmns = sorted([r for r in self.tb_cpns if re.match(
+            r"table column$", r["label"])], key=lambda x: (x["pn"], x["layoutno"], x["x0"]))
+        clmns = Recognizer.layouts_cleanup(self.boxes, clmns, 5, 0.5)
+        for b in self.boxes:
+            if b.get("layout_type", "") != "table":
+                continue
+            ii = Recognizer.find_overlapped_with_threashold(b, rows, thr=0.3)
+            if ii is not None:
+                b["R"] = ii
+                b["R_top"] = rows[ii]["top"]
+                b["R_bott"] = rows[ii]["bottom"]
+
+            ii = Recognizer.find_overlapped_with_threashold(
+                b, headers, thr=0.3)
+            if ii is not None:
+                b["H_top"] = headers[ii]["top"]
+                b["H_bott"] = headers[ii]["bottom"]
+                b["H_left"] = headers[ii]["x0"]
+                b["H_right"] = headers[ii]["x1"]
+                b["H"] = ii
+
+            ii = Recognizer.find_horizontally_tightest_fit(b, clmns)
+            if ii is not None:
+                b["C"] = ii
+                b["C_left"] = clmns[ii]["x0"]
+                b["C_right"] = clmns[ii]["x1"]
+
+            ii = Recognizer.find_overlapped_with_threashold(b, spans, thr=0.3)
+            if ii is not None:
+                b["H_top"] = spans[ii]["top"]
+                b["H_bott"] = spans[ii]["bottom"]
+                b["H_left"] = spans[ii]["x0"]
+                b["H_right"] = spans[ii]["x1"]
+                b["SP"] = ii
+        print(f'[_table_transformer_job] 调用结束')
+    
+    def _text_merge(self):
+        print(f'[_text_merge] 开始调用')
+        # merge adjusted boxes
+        bxs = self.boxes
+
+        def end_with(b, txt):
+            txt = txt.strip()
+            tt = b.get("text", "").strip()
+            return tt and tt.find(txt) == len(tt) - len(txt)
+
+        def start_with(b, txts):
+            tt = b.get("text", "").strip()
+            return tt and any([tt.find(t.strip()) == 0 for t in txts])
+
+        # horizontally merge adjacent box with the same layout
+        i = 0
+        while i < len(bxs) - 1:
+            b = bxs[i]
+            b_ = bxs[i + 1]
+            if b.get("layoutno", "0") != b_.get("layoutno", "1") or b.get("layout_type", "") in ["table", "figure",
+                                                                                                 "equation"]:
+                i += 1
+                continue
+            if abs(self._y_dis(b, b_)
+                   ) < self.mean_height[bxs[i]["page_number"] - 1] / 3:
+                # merge
+                bxs[i]["x1"] = b_["x1"]
+                bxs[i]["top"] = (b["top"] + b_["top"]) / 2
+                bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
+                bxs[i]["text"] += b_["text"]
+                bxs.pop(i + 1)
+                continue
+            i += 1
+        self.boxes = bxs
+           
     def __call__(self, fnm, need_image = True, zoomin=3, return_html=False):
         print(f'[__call__] 调用')
         self.__images__(fnm)
         self._layouts_rec(zoomin)
+        self._table_transformer_job(zoomin)
+        self._text_merge()
+        
 
 if __name__ == "__main__":
     print(f'开始执行')
