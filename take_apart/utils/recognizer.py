@@ -321,7 +321,7 @@ class Recognizer:
         return inputs
 
     def postprocess(self, boxes, inputs, thr):
-        print(f'[Recoginzer.postprocess] 开始调用， boxes[0] 去分析，boxes[0][0]应该是类别id，测试：{boxes[0][0][5]}')
+        print(f'[Recoginzer.postprocess] 开始调用')
         if "scale_factor" in self.input_names:
             bb = []
             for b in boxes:
@@ -389,11 +389,10 @@ class Recognizer:
 
             return keep_boxes
 
-        # boxes = np.squeeze(boxes).T
-        boxes = np.squeeze(boxes)
+        boxes = np.squeeze(boxes).T
         # Filter out object confidence scores below threshold
         scores = np.max(boxes[:, 4:], axis=1)
-        print(f'test: scores is {scores}')
+
         boxes = boxes[scores > thr, :]
         scores = scores[scores > thr]
         if len(boxes) == 0:
