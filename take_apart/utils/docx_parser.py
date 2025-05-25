@@ -18,7 +18,7 @@ from docx import Document
 import re
 import pandas as pd
 from collections import Counter
-from utils.nlp import rag_tokenizer
+from nlp import rag_tokenizer
 from io import BytesIO
 
 import sys
