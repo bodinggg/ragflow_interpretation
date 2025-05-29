@@ -758,8 +758,6 @@ class PdfParser:
                 continue
             tables[k0].extend(tables[k])
             del tables[k]
-        
-        print(f'[_extract_table_figure] 调用结束')
 
         def x_overlapped(a, b):
             return not any([a["x1"] < b["x0"], a["x0"] > b["x1"]])
@@ -813,6 +811,107 @@ class PdfParser:
                     tk)
             self.boxes.pop(i)
 
+        def cropout(bxs, ltype, poss):
+            nonlocal ZM
+            pn = set([b["page_number"] - 1 for b in bxs])
+            if len(pn) < 2:
+                pn = list(pn)[0]
+                ht = self.page_cum_height[pn]
+                b = {
+                    "x0": np.min([b["x0"] for b in bxs]),
+                    "top": np.min([b["top"] for b in bxs]) - ht,
+                    "x1": np.max([b["x1"] for b in bxs]),
+                    "bottom": np.max([b["bottom"] for b in bxs]) - ht
+                }
+                louts = [layout for layout in self.page_layout[pn] if layout["type"] == ltype]
+                ii = Recognizer.find_overlapped(b, louts, naive=True)
+                if ii is not None:
+                    b = louts[ii]
+                else:
+                    logging.warning(
+                        f"Missing layout match: {pn + 1},%s" %
+                        (bxs[0].get(
+                            "layoutno", "")))
+
+                left, top, right, bott = b["x0"], b["top"], b["x1"], b["bottom"]
+                if right < left:
+                    right = left + 1
+                poss.append((pn + self.page_from, left, right, top, bott))
+                return self.page_images[pn] \
+                    .crop((left * ZM, top * ZM,
+                           right * ZM, bott * ZM))
+            pn = {}
+            for b in bxs:
+                p = b["page_number"] - 1
+                if p not in pn:
+                    pn[p] = []
+                pn[p].append(b)
+            pn = sorted(pn.items(), key=lambda x: x[0])
+            imgs = [cropout(arr, ltype, poss) for p, arr in pn]
+            pic = Image.new("RGB",
+                            (int(np.max([i.size[0] for i in imgs])),
+                             int(np.sum([m.size[1] for m in imgs]))),
+                            (245, 245, 245))
+            height = 0
+            for img in imgs:
+                pic.paste(img, (0, int(height)))
+                height += img.size[1]
+            return pic
+
+        res = []
+        positions = []
+        figure_results = []
+        figure_positions = []
+        # crop figure out and add caption
+        for k, bxs in figures.items():
+            txt = "\n".join([b["text"] for b in bxs])
+            if not txt:
+                continue
+
+            poss = []
+
+            if separate_tables_figures:
+                figure_results.append(
+                    (cropout(
+                        bxs,
+                        "figure", poss),
+                     [txt]))
+                figure_positions.append(poss)
+            else:
+                res.append(
+                    (cropout(
+                        bxs,
+                        "figure", poss),
+                     [txt]))
+                positions.append(poss)
+
+        for k, bxs in tables.items():
+            if not bxs:
+                continue
+            bxs = Recognizer.sort_Y_firstly(bxs, np.mean(
+                [(b["bottom"] - b["top"]) / 2 for b in bxs]))
+
+            poss = []
+
+            res.append((cropout(bxs, "table", poss),
+                        self.tbl_det.construct_table(bxs, html=return_html, is_english=self.is_english)))
+            positions.append(poss)
+
+        print(f'[_extract_table_figure] 调用结束')
+        if separate_tables_figures:
+            assert len(positions) + len(figure_positions) == len(res) + len(figure_results)
+            if need_position:
+                return list(zip(res, positions)), list(zip(figure_results, figure_positions))
+            else:
+                return res, figure_results
+        else:
+            assert len(positions) == len(res)
+            if need_position:
+                return list(zip(res, positions))
+            else:
+                return res
+    
+        
     def __filterout_scraps(self, boxes, ZM):
         print(f'[__filterout_scraps] 开始调用')
         def width(b):
