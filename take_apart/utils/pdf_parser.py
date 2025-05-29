@@ -23,6 +23,7 @@ print(f'Recognizer 待加载')
 from recognizer import Recognizer
 from ocr import OCR
 from layout_recognizer import LayoutRecognizer4YOLOv10 as LayoutRecognizer
+from nlp import rag_tokenizer
 
 #from layout_recognizer import LayoutRecognizer
 
@@ -35,6 +36,15 @@ print(f'模块加载完成')
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+def get_project_base_directory():
+    return os.path.abspath(
+        os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            os.pardir,
+            os.pardir,
+        )
+    )
+
 
 class PdfParser:
     def __init__(self):
@@ -42,7 +52,23 @@ class PdfParser:
         self.layouter = LayoutRecognizer("layout")
         
         self.tbl_det = TableStructureRecognizer()
-    
+
+        # _concat_downward()
+        self.updown_cnt_mdl = xgb.Booster()
+        try:
+            model_dir = os.path.join(
+                get_project_base_directory(),
+                "rag/res/deepdoc")
+            self.updown_cnt_mdl.load_model(os.path.join(
+                model_dir, "updown_concat_xgb.model"))
+        except Exception:
+            model_dir = snapshot_download(
+                repo_id="InfiniFlow/text_concat_xgb_v1.0",
+                local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
+                local_dir_use_symlinks=False)
+            self.updown_cnt_mdl.load_model(os.path.join(
+                model_dir, "updown_concat_xgb.model"))
+        
     def __char_width(self, c):
         return (c["x1"] - c["x0"]) // max(len(c["text"]), 1)
 
@@ -57,7 +83,76 @@ class PdfParser:
             self, a, b):
         return (
             b["top"] + b["bottom"] - a["top"] - a["bottom"]) / 2
-   
+
+    def _match_proj(self, b):
+        proj_patt = [
+            r"第[零一二三四五六七八九十百]+章",
+            r"第[零一二三四五六七八九十百]+[条节]",
+            r"[零一二三四五六七八九十百]+[、是 　]",
+            r"[\(（][零一二三四五六七八九十百]+[）\)]",
+            r"[\(（][0-9]+[）\)]",
+            r"[0-9]+(、|\.[　 ]|）|\.[^0-9./a-zA-Z_%><-]{4,})",
+            r"[0-9]+\.[0-9.]+(、|\.[ 　])",
+            r"[⚫•➢①② ]",
+        ]
+        return any([re.match(p, b["text"]) for p in proj_patt])
+
+    def _updown_concat_features(self, up, down):
+        w = max(self.__char_width(up), self.__char_width(down))
+        h = max(self.__height(up), self.__height(down))
+        y_dis = self._y_dis(up, down)
+        LEN = 6
+        tks_down = rag_tokenizer.tokenize(down["text"][:LEN]).split()
+        tks_up = rag_tokenizer.tokenize(up["text"][-LEN:]).split()
+        tks_all = up["text"][-LEN:].strip() \
+            + (" " if re.match(r"[a-zA-Z0-9]+",
+                               up["text"][-1] + down["text"][0]) else "") \
+            + down["text"][:LEN].strip()
+        tks_all = rag_tokenizer.tokenize(tks_all).split()
+        fea = [
+            up.get("R", -1) == down.get("R", -1),
+            y_dis / h,
+            down["page_number"] - up["page_number"],
+            up["layout_type"] == down["layout_type"],
+            up["layout_type"] == "text",
+            down["layout_type"] == "text",
+            up["layout_type"] == "table",
+            down["layout_type"] == "table",
+            True if re.search(
+                r"([。？！；!?;+)）]|[a-z]\.)$",
+                up["text"]) else False,
+            True if re.search(r"[，：‘“、0-9（+-]$", up["text"]) else False,
+            True if re.search(
+                r"(^.?[/,?;:\]，。；：’”？！》】）-])",
+                down["text"]) else False,
+            True if re.match(r"[\(（][^\(\)（）]+[）\)]$", up["text"]) else False,
+            True if re.search(r"[，,][^。.]+$", up["text"]) else False,
+            True if re.search(r"[，,][^。.]+$", up["text"]) else False,
+            True if re.search(r"[\(（][^\)）]+$", up["text"])
+            and re.search(r"[\)）]", down["text"]) else False,
+            self._match_proj(down),
+            True if re.match(r"[A-Z]", down["text"]) else False,
+            True if re.match(r"[A-Z]", up["text"][-1]) else False,
+            True if re.match(r"[a-z0-9]", up["text"][-1]) else False,
+            True if re.match(r"[0-9.%,-]+$", down["text"]) else False,
+            up["text"].strip()[-2:] == down["text"].strip()[-2:] if len(up["text"].strip()
+                                                                        ) > 1 and len(
+                down["text"].strip()) > 1 else False,
+            up["x0"] > down["x1"],
+            abs(self.__height(up) - self.__height(down)) / min(self.__height(up),
+                                                               self.__height(down)),
+            self._x_dis(up, down) / max(w, 0.000001),
+            (len(up["text"]) - len(down["text"])) /
+            max(len(up["text"]), len(down["text"])),
+            len(tks_all) - len(tks_up) - len(tks_down),
+            len(tks_down) - len(tks_up),
+            tks_down[-1] == tks_up[-1] if tks_down and tks_up else False,
+            max(down["in_row"], up["in_row"]),
+            abs(down["in_row"] - up["in_row"]),
+            len(tks_down) == 1 and rag_tokenizer.tag(tks_down[0]).find("n") >= 0,
+            len(tks_up) == 1 and rag_tokenizer.tag(tks_up[0]).find("n") >= 0
+        ]
+        return fea
     
     def _has_color(self, o):
         #print(f'[_has_color] 调用')
@@ -72,7 +167,6 @@ class PdfParser:
         print(f'[__ocr] 调用')
         start = timer()
         bxs = self.ocr.detect(np.array(img), device_id)
-        logging.info(f"__ocr detecting boxes of a image cost ({timer() - start}s)")
 
         start = timer()
         if not bxs:
@@ -127,9 +221,51 @@ class PdfParser:
                                               for b in bxs])
         self.boxes.append(bxs)
     
+    def proj_match(self, line):
+        if len(line) <= 2:
+            return
+        if re.match(r"[0-9 ().,%%+/-]+$", line):
+            return False
+        for p, j in [
+            (r"第[零一二三四五六七八九十百]+章", 1),
+            (r"第[零一二三四五六七八九十百]+[条节]", 2),
+            (r"[零一二三四五六七八九十百]+[、 　]", 3),
+            (r"[\(（][零一二三四五六七八九十百]+[）\)]", 4),
+            (r"[0-9]+(、|\.[　 ]|\.[^0-9])", 5),
+            (r"[0-9]+\.[0-9]+(、|[. 　]|[^0-9])", 6),
+            (r"[0-9]+\.[0-9]+\.[0-9]+(、|[ 　]|[^0-9])", 7),
+            (r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(、|[ 　]|[^0-9])", 8),
+            (r".{,48}[：:?？]$", 9),
+            (r"[0-9]+）", 10),
+            (r"[\(（][0-9]+[）\)]", 11),
+            (r"[零一二三四五六七八九十百]+是", 12),
+            (r"[⚫•➢✓]", 12)
+        ]:
+            if re.match(p, line):
+                return j
+        return
+
+    def _line_tag(self, bx, ZM):
+        pn = [bx["page_number"]]
+        top = bx["top"] - self.page_cum_height[pn[0] - 1]
+        bott = bx["bottom"] - self.page_cum_height[pn[0] - 1]
+        page_images_cnt = len(self.page_images)
+        if pn[-1] - 1 >= page_images_cnt:
+            return ""
+        while bott * ZM > self.page_images[pn[-1] - 1].size[1]:
+            bott -= self.page_images[pn[-1] - 1].size[1] / ZM
+            pn.append(pn[-1] + 1)
+            if pn[-1] - 1 >= page_images_cnt:
+                return ""
+
+        return "@@{}\t{:.1f}\t{:.1f}\t{:.1f}\t{:.1f}##" \
+            .format("-".join([str(p) for p in pn]),
+                    bx["x0"], bx["x1"], top, bott)
     
     def __images__(self, fnm, zoomin=3, page_from=0, page_to=299, callback = None):
         print(f'[__images__] 调用')
+        print(f"这是一个变量{fnm}——文件名")
+        print("这是一个变量{}——文件名".format(fnm))
         self.lefted_chars = []
         self.mean_height = []
         self.mean_width = []
@@ -248,7 +384,7 @@ class PdfParser:
         MARGIN = 10
         self.tb_cpns = []
         assert len(self.page_layout) == len(self.page_images)
-        print(f'test: self.page_images {self.page_layout}')
+        print(f'test: self.layout {self.page_layout}')
         for p, tbls in enumerate(self.page_layout):  # for page
             tbls = [f for f in tbls if f["type"] == "table"]
             tbcnt.append(len(tbls))
@@ -371,18 +507,401 @@ class PdfParser:
                 bxs.pop(i + 1)
                 continue
             i += 1
+            
+            dis_thr = 1
+            dis = b["x1"] - b_["x0"]
+            if b.get("layout_type", "") != "text" or b_.get(
+                    "layout_type", "") != "text":
+                if end_with(b, "，") or start_with(b_, "（，"):
+                    dis_thr = -8
+                else:
+                    i += 1
+                    continue
+
+            if abs(self._y_dis(b, b_)) < self.mean_height[bxs[i]["page_number"] - 1] / 5 \
+                    and dis >= dis_thr and b["x1"] < b_["x1"]:
+                # merge
+                bxs[i]["x1"] = b_["x1"]
+                bxs[i]["top"] = (b["top"] + b_["top"]) / 2
+                bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
+                bxs[i]["text"] += b_["text"]
+                bxs.pop(i + 1)
+                continue
+            i += 1
         self.boxes = bxs
-           
-    def __call__(self, fnm, need_image = True, zoomin=3, return_html=False):
+        print(f'[_text_merge] 调用结束')
+    
+    def _concat_downward(self, concat_between_pages=True):
+        # count boxes in the same row as a 
+        print(f'[_concat_downward] 开始调用')
+        for i in range(len(self.boxes)):
+            mh = self.mean_height[self.boxes[i]["page_number"] - 1]
+            self.boxes[i]["in_row"] = 0
+            j = max(0, i - 12)
+            while j < min(i + 12, len(self.boxes)):
+                if j == i:
+                    j += 1
+                    continue
+                ydis = self._y_dis(self.boxes[i], self.boxes[j]) / mh
+                if abs(ydis) < 1:
+                    self.boxes[i]["in_row"] += 1
+                elif ydis > 0:
+                    break
+                j += 1
+
+        # concat between rows
+        boxes = deepcopy(self.boxes)
+        blocks = []
+        while boxes:
+            chunks = []
+
+            def dfs(up, dp):
+                chunks.append(up)
+                i = dp
+                while i < min(dp + 12, len(boxes)):
+                    ydis = self._y_dis(up, boxes[i])
+                    smpg = up["page_number"] == boxes[i]["page_number"]
+                    mh = self.mean_height[up["page_number"] - 1]
+                    mw = self.mean_width[up["page_number"] - 1]
+                    if smpg and ydis > mh * 4:
+                        break
+                    if not smpg and ydis > mh * 16:
+                        break
+                    down = boxes[i]
+                    if not concat_between_pages and down["page_number"] > up["page_number"]:
+                        break
+                    
+                    if up.get("R", "") != down.get(
+                            "R", "") and up["text"][-1] != "，":
+                        i += 1
+                        continue
+
+                    if re.match(r"[0-9]{2,3}/[0-9]{3}$", up["text"]) \
+                            or re.match(r"[0-9]{2,3}/[0-9]{3}$", down["text"]) \
+                            or not down["text"].strip():
+                        i += 1
+                        continue
+
+                    if not down["text"].strip() or not up["text"].strip():
+                        i += 1
+                        continue
+
+                    if up["x1"] < down["x0"] - 10 * \
+                            mw or up["x0"] > down["x1"] + 10 * mw:
+                        i += 1
+                        continue
+
+                    if i - dp < 5 and up.get("layout_type") == "text":
+                        if up.get("layoutno", "1") == down.get(
+                                "layoutno", "2"):
+                            dfs(down, i + 1)
+                            boxes.pop(i)
+                            return
+                        i += 1
+                        continue
+                    fea = self._updown_concat_features(up, down)
+                    if self.updown_cnt_mdl.predict(
+                            xgb.DMatrix([fea]))[0] <= 0.5:
+                        i += 1
+                        continue
+                    dfs(down, i + 1)
+                    boxes.pop(i)
+                    return
+
+            dfs(boxes[0], 1)
+            boxes.pop(0)
+            if chunks:
+                blocks.append(chunks)
+
+        # concat within each block
+        boxes = []
+        for b in blocks:
+            if len(b) == 1:
+                boxes.append(b[0])
+                continue
+            t = b[0]
+            for c in b[1:]:
+                t["text"] = t["text"].strip()
+                c["text"] = c["text"].strip()
+                if not c["text"]:
+                    continue
+                if t["text"] and re.match(
+                        r"[0-9\.a-zA-Z]+$", t["text"][-1] + c["text"][-1]):
+                    t["text"] += " "
+                t["text"] += c["text"]
+                t["x0"] = min(t["x0"], c["x0"])
+                t["x1"] = max(t["x1"], c["x1"])
+                t["page_number"] = min(t["page_number"], c["page_number"])
+                t["bottom"] = c["bottom"]
+                if not t["layout_type"] \
+                        and c["layout_type"]:
+                    t["layout_type"] = c["layout_type"]
+            boxes.append(t)
+
+        self.boxes = Recognizer.sort_Y_firstly(boxes, 0)
+        print(f'[_concat_downward] 调用结束')
+    
+    def _filter_forpages(self):
+        print(f'[_filter_forpages] 开始调用')
+        if not self.boxes:
+            return
+        findit = False
+        i = 0
+        while i < len(self.boxes):
+            if not re.match(r"(contents|目录|目次|table of contents|致谢|acknowledge)$",
+                            re.sub(r"( | |\u3000)+", "", self.boxes[i]["text"].lower())):
+                i += 1
+                continue
+            findit = True
+            eng = re.match(
+                r"[0-9a-zA-Z :'.-]{5,}",
+                self.boxes[i]["text"].strip())
+            self.boxes.pop(i)
+            if i >= len(self.boxes):
+                break
+            prefix = self.boxes[i]["text"].strip()[:3] if not eng else " ".join(
+                self.boxes[i]["text"].strip().split()[:2])
+            while not prefix:
+                self.boxes.pop(i)
+                if i >= len(self.boxes):
+                    break
+                prefix = self.boxes[i]["text"].strip()[:3] if not eng else " ".join(
+                    self.boxes[i]["text"].strip().split()[:2])
+            self.boxes.pop(i)
+            if i >= len(self.boxes) or not prefix:
+                break
+            for j in range(i, min(i + 128, len(self.boxes))):
+                if not re.match(prefix, self.boxes[j]["text"]):
+                    continue
+                for k in range(i, j):
+                    self.boxes.pop(i)
+                break
+        if findit:
+            return
+
+        page_dirty = [0] * len(self.page_images)
+        for b in self.boxes:
+            if re.search(r"(··|··|··)", b["text"]):
+                page_dirty[b["page_number"] - 1] += 1
+        page_dirty = set([i + 1 for i, t in enumerate(page_dirty) if t > 3])
+        if not page_dirty:
+            print(f'[_filter_forpages] 不需要过滤，调用结束')
+            return
+        i = 0
+        while i < len(self.boxes):
+            if self.boxes[i]["page_number"] in page_dirty:
+                self.boxes.pop(i)
+                continue
+            i += 1
+        
+        print(f'[_filter_forpages] 调用结束')
+    
+    def _extract_table_figure(self, need_image, ZM, return_html, need_position, separate_tables_figures=False):
+        print(f'[_extract_table_figure] 开始调用')
+        tables = {}
+        figures = {}
+        # extract figure and table boxes
+        i = 0
+        lst_lout_no = ""
+        nomerge_lout_no = []
+        while i < len(self.boxes):
+            if "layoutno" not in self.boxes[i]:
+                i += 1
+                continue
+            lout_no = str(self.boxes[i]["page_number"]) + \
+                "-" + str(self.boxes[i]["layoutno"])
+            if TableStructureRecognizer.is_caption(self.boxes[i]) or self.boxes[i]["layout_type"] in ["table caption",
+                                                                                                      "title",
+                                                                                                      "figure caption",
+                                                                                                      "reference"]:
+                nomerge_lout_no.append(lst_lout_no)
+            if self.boxes[i]["layout_type"] == "table":
+                if re.match(r"(数据|资料|图表)*来源[:： ]", self.boxes[i]["text"]):
+                    self.boxes.pop(i)
+                    continue
+                if lout_no not in tables:
+                    tables[lout_no] = []
+                tables[lout_no].append(self.boxes[i])
+                self.boxes.pop(i)
+                lst_lout_no = lout_no
+                continue
+            if need_image and self.boxes[i]["layout_type"] == "figure":
+                if re.match(r"(数据|资料|图表)*来源[:： ]", self.boxes[i]["text"]):
+                    self.boxes.pop(i)
+                    continue
+                if lout_no not in figures:
+                    figures[lout_no] = []
+                figures[lout_no].append(self.boxes[i])
+                self.boxes.pop(i)
+                lst_lout_no = lout_no
+                continue
+            i += 1
+
+        # merge table on different pages
+        nomerge_lout_no = set(nomerge_lout_no)
+        tbls = sorted([(k, bxs) for k, bxs in tables.items()],
+                      key=lambda x: (x[1][0]["top"], x[1][0]["x0"]))
+
+        i = len(tbls) - 1
+        while i - 1 >= 0:
+            k0, bxs0 = tbls[i - 1]
+            k, bxs = tbls[i]
+            i -= 1
+            if k0 in nomerge_lout_no:
+                continue
+            if bxs[0]["page_number"] == bxs0[0]["page_number"]:
+                continue
+            if bxs[0]["page_number"] - bxs0[0]["page_number"] > 1:
+                continue
+            mh = self.mean_height[bxs[0]["page_number"] - 1]
+            if self._y_dis(bxs0[-1], bxs[0]) > mh * 23:
+                continue
+            tables[k0].extend(tables[k])
+            del tables[k]
+        
+        print(f'[_extract_table_figure] 调用结束')
+
+        def x_overlapped(a, b):
+            return not any([a["x1"] < b["x0"], a["x0"] > b["x1"]])
+
+        # find captions and pop out
+        i = 0
+        while i < len(self.boxes):
+            c = self.boxes[i]
+            # mh = self.mean_height[c["page_number"]-1]
+            if not TableStructureRecognizer.is_caption(c):
+                i += 1
+                continue
+
+            # find the nearest layouts
+            def nearest(tbls):
+                nonlocal c
+                mink = ""
+                minv = 1000000000
+                for k, bxs in tbls.items():
+                    for b in bxs:
+                        if b.get("layout_type", "").find("caption") >= 0:
+                            continue
+                        y_dis = self._y_dis(c, b)
+                        x_dis = self._x_dis(
+                            c, b) if not x_overlapped(
+                            c, b) else 0
+                        dis = y_dis * y_dis + x_dis * x_dis
+                        if dis < minv:
+                            mink = k
+                            minv = dis
+                return mink, minv
+
+            tk, tv = nearest(tables)
+            fk, fv = nearest(figures)
+            # if min(tv, fv) > 2000:
+            #    i += 1
+            #    continue
+            if tv < fv and tk:
+                tables[tk].insert(0, c)
+                logging.debug(
+                    "TABLE:" +
+                    self.boxes[i]["text"] +
+                    "; Cap: " +
+                    tk)
+            elif fk:
+                figures[fk].insert(0, c)
+                logging.debug(
+                    "FIGURE:" +
+                    self.boxes[i]["text"] +
+                    "; Cap: " +
+                    tk)
+            self.boxes.pop(i)
+
+    def __filterout_scraps(self, boxes, ZM):
+        print(f'[__filterout_scraps] 开始调用')
+        def width(b):
+            return b["x1"] - b["x0"]
+
+        def height(b):
+            return b["bottom"] - b["top"]
+
+        def usefull(b):
+            if b.get("layout_type"):
+                return True
+            if width(
+                    b) > self.page_images[b["page_number"] - 1].size[0] / ZM / 3:
+                return True
+            if b["bottom"] - b["top"] > self.mean_height[b["page_number"] - 1]:
+                return True
+            return False
+
+        res = []
+        while boxes:
+            lines = []
+            widths = []
+            pw = self.page_images[boxes[0]["page_number"] - 1].size[0] / ZM
+            mh = self.mean_height[boxes[0]["page_number"] - 1]
+            mj = self.proj_match(
+                boxes[0]["text"]) or boxes[0].get(
+                "layout_type",
+                "") == "title"
+
+            def dfs(line, st):
+                nonlocal mh, pw, lines, widths
+                lines.append(line)
+                widths.append(width(line))
+                mmj = self.proj_match(
+                    line["text"]) or line.get(
+                    "layout_type",
+                    "") == "title"
+                for i in range(st + 1, min(st + 20, len(boxes))):
+                    if (boxes[i]["page_number"] - line["page_number"]) > 0:
+                        break
+                    if not mmj and self._y_dis(
+                            line, boxes[i]) >= 3 * mh and height(line) < 1.5 * mh:
+                        break
+
+                    if not usefull(boxes[i]):
+                        continue
+                    if mmj or \
+                            (self._x_dis(boxes[i], line) < pw / 10): \
+                            # and abs(width(boxes[i])-width_mean)/max(width(boxes[i]),width_mean)<0.5):
+                        # concat following
+                        dfs(boxes[i], i)
+                        boxes.pop(i)
+                        break
+
+            try:
+                if usefull(boxes[0]):
+                    dfs(boxes[0], 0)
+                else:
+                    logging.debug("WASTE: " + boxes[0]["text"])
+            except Exception:
+                pass
+            boxes.pop(0)
+            mw = np.mean(widths)
+            if mj or mw / pw >= 0.35 or mw > 200:
+                res.append(
+                    "\n".join([c["text"] + self._line_tag(c, ZM) for c in lines]))
+            else:
+                logging.debug("REMOVED: " +
+                              "<<".join([c["text"] for c in lines]))
+
+        print(f'[__filterout_scraps] 调用结束')
+        return "\n\n".join(res)
+    
+    def __call__(self, fnm, need_image = True, zoomin=3, return_html=False):    # 实际的调用逻辑（入口）
         print(f'[__call__] 调用')
-        self.__images__(fnm)
+        self.__images__(fnm)    # 传入了文件名字 ，解析
         self._layouts_rec(zoomin)
         self._table_transformer_job(zoomin)
         self._text_merge()
-        
+        self._concat_downward()
+        self._filter_forpages()
+        tbls = self._extract_table_figure(
+            need_image, zoomin, return_html, False)
+        return self.__filterout_scraps(deepcopy(self.boxes), zoomin), tbls
+
 
 if __name__ == "__main__":
     print(f'开始执行')
     psr = PdfParser()
-    psr_result = psr(sys.argv[1])
-    print(psr_result)
+    psr_result, psr_tbls = psr(sys.argv[1])
+    # print(f'final psr_result is {psr_result}')
+    print(f'tbls is {psr_tbls}')
